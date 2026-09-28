@@ -2,7 +2,7 @@ import { $, component$, useSignal, useVisibleTask$, type QRL } from "@builder.io
 import { type DocumentHead } from "@builder.io/qwik-city";
 import { createSeedProject, STATUS_LABELS, uid } from "../data";
 import type { ReviewStatus, SignItem, SignProject } from "../types";
-import { analyzeSign, cloneTerms, diffText } from "../utils";
+import { analyzeSign, cloneTerms, confirmationGate, diffText, gatePassed, termInText } from "../utils";
 
 const STORAGE_KEY = "sologsb-1008-project-v1";
 const WIDTHS = [320, 480, 720, 960] as const;
@@ -21,8 +21,101 @@ function statusClass(status: ReviewStatus) {
   return "badge-neutral";
 }
 
+// 已确认标识只要不满足三道门槛，就归回待确认，保证旧数据也受新规则约束。
+function normalizeProject(draft: SignProject): SignProject {
+  draft.signs.forEach((sign) => {
+    if (sign.status === "confirmed" && !gatePassed(confirmationGate(sign))) {
+      sign.status = "pending";
+    }
+  });
+  return draft;
+}
+
+// 译文、术语或意见再改后，已确认标识一律退回待确认。
+function invalidateConfirmation(sign: SignItem) {
+  if (sign.status === "confirmed") sign.status = "pending";
+}
+
+interface GateRow {
+  key: string;
+  ok: boolean;
+  text: string;
+}
+
+function gateRows(sign: SignItem): GateRow[] {
+  const gate = confirmationGate(sign);
+  return [
+    {
+      key: "version",
+      ok: gate.versionSaved,
+      text: gate.versionSaved ? "已保存过版本快照" : "尚未保存过版本，请先点「保存版本快照」",
+    },
+    ...gate.missingRequired.map((term) => ({
+      key: `missing-${term.id}`,
+      ok: false,
+      text: `必选术语「${term.source} → ${term.target}」未出现在译文中`,
+    })),
+    ...gate.unconfirmedRequired.map((term) => ({
+      key: `unconfirmed-${term.id}`,
+      ok: false,
+      text: `必选术语「${term.source} → ${term.target}」已在译文中，但尚未逐条确认`,
+    })),
+    ...gate.unresolvedComments.map((comment) => ({
+      key: `comment-${comment.id}`,
+      ok: false,
+      text: `审校意见未解决：${comment.body.length > 24 ? `${comment.body.slice(0, 24)}…` : comment.body}`,
+    })),
+    ...(gate.emergencyLocked ? [{ key: "emergency", ok: false, text: "紧急修订模式未退出，需重新走审校流程" }] : []),
+  ];
+}
+
+const ConfirmGatePanel = component$<{ sign: SignItem }>(({ sign }) => {
+  const passed = gatePassed(confirmationGate(sign));
+  const rows = gateRows(sign);
+  return (
+    <div class={`border-b px-6 py-3 ${passed ? "bg-success/10" : "bg-warning/10"}`}>
+      <div class="flex items-center gap-2 text-sm font-bold">
+        <span class={passed ? "text-success" : "text-warning"}>
+          {passed ? "✓ 确认门槛已全部通过，可以标记「已确认」" : "确认门槛未通过，「已确认」按钮暂不可用"}
+        </span>
+      </div>
+      <ul class="mt-1 space-y-0.5 text-xs">
+        {rows.map((row) => (
+          <li key={row.key} class={`flex items-center gap-1.5 ${row.ok ? "text-success" : "text-slate-700"}`}>
+            <span class="font-black">{row.ok ? "✓" : "•"}</span>
+            <span>{row.text}</span>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+});
+
+const PendingSteps = component$<{ sign: SignItem }>(({ sign }) => {
+  if (sign.status === "confirmed") return null;
+  const gate = confirmationGate(sign);
+  const steps = [
+    ...(gate.versionSaved ? [] : ["保存版本"]),
+    ...gate.missingRequired.map((item) => `缺术语：${item.target}`),
+    ...gate.unconfirmedRequired.map((item) => `确认术语：${item.target}`),
+    ...(gate.unresolvedComments.length ? [`解决 ${gate.unresolvedComments.length} 条意见`] : []),
+    ...(gate.emergencyLocked ? ["退出紧急修订"] : []),
+  ];
+  if (!steps.length) steps.push("点「已确认」完成");
+  return (
+    <ul class="mt-2 space-y-0.5 border-t border-slate-200 pt-2 text-[11px] leading-4">
+      {steps.map((step, index) => (
+        <li key={`${sign.id}-step-${index}`} class="flex items-start gap-1 text-amber-700">
+          <span class="font-black">•</span>
+          <span class="min-w-0 truncate">{step}</span>
+        </li>
+      ))}
+    </ul>
+  );
+});
+
 export default component$(() => {
-  const project = useSignal<SignProject>(createSeedProject());
+  const project = useSignal<SignProject>(normalizeProject(createSeedProject()));
   const past = useSignal<SignProject[]>([]);
   const future = useSignal<SignProject[]>([]);
   const hydrated = useSignal(false);
@@ -84,14 +177,15 @@ export default component$(() => {
   });
 
   const setStatus = $((status: ReviewStatus) => {
+    const current = project.value.signs.find((item) => item.id === project.value.activeSignId);
+    if (!current) return;
+    if (status === "confirmed" && !gatePassed(confirmationGate(current))) {
+      toast.value = "请先完成确认门槛中的待处理步骤";
+      return;
+    }
     commit("更新审校状态", (draft) => {
       const sign = draft.signs.find((item) => item.id === draft.activeSignId);
-      if (!sign) return;
-      if (sign.emergencyRevision && status === "confirmed") {
-        sign.status = "pending";
-      } else {
-        sign.status = status;
-      }
+      if (sign) sign.status = status;
     });
   });
 
@@ -150,7 +244,7 @@ export default component$(() => {
         resolved: false,
         replies: [],
       });
-      sign.status = sign.status === "confirmed" ? "changes" : sign.status;
+      invalidateConfirmation(sign);
     });
     commentDraft.value = "";
   });
@@ -161,6 +255,7 @@ export default component$(() => {
     updateActive("回复审校意见", (sign) => {
       const comment = sign.comments.find((item) => item.id === commentId);
       comment?.replies.push({ id: uid("reply"), author: "当前审校员", body, createdAt: new Date().toISOString() });
+      invalidateConfirmation(sign);
     });
     replyDraft.value = "";
     replyingTo.value = "";
@@ -186,7 +281,7 @@ export default component$(() => {
     if (!hydrated.value) {
       try {
         const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "") as { schema: number; project: SignProject };
-        if (stored.schema === 1 && stored.project?.signs?.length) project.value = stored.project;
+        if (stored.schema === 1 && stored.project?.signs?.length) project.value = normalizeProject(stored.project);
         const requestedPreview = new URLSearchParams(window.location.search).get("preview") ?? "";
         previewId.value = requestedPreview;
         readOnly.value = Boolean(requestedPreview);
@@ -338,6 +433,7 @@ export default component$(() => {
                       {risk.risk === "high" ? "高风险" : risk.risk === "medium" ? "需留意" : "版面正常"}
                     </span>
                   </div>
+                  <PendingSteps sign={sign} />
                   <span class="sr-only">第 {index + 1} 条</span>
                 </button>
               );
@@ -352,13 +448,32 @@ export default component$(() => {
                 <div class="text-xs font-bold uppercase tracking-[0.16em] text-blue-600">{active().code} · {active().scenario}</div>
                 <h1 class="mt-1 text-xl font-bold">中文原文与译文校对</h1>
               </div>
-              <div class="join">
-                {(["draft", "pending", "changes", "confirmed"] as ReviewStatus[]).map((status) => (
-                  <button key={status} class={`btn join-item btn-sm ${active().status === status ? "btn-primary" : "btn-outline"}`} onClick$={() => setStatus(status)}>{STATUS_LABELS[status]}</button>
-                ))}
+              <div>
+                <div class="join">
+                  {(["draft", "pending", "changes", "confirmed"] as ReviewStatus[]).map((status) => {
+                    const gate = confirmationGate(active());
+                    const confirmLocked = status === "confirmed" && !gatePassed(gate);
+                    return (
+                      <button
+                        key={status}
+                        class={`btn join-item btn-sm ${active().status === status ? "btn-primary" : "btn-outline"} ${confirmLocked ? "btn-disabled" : ""}`}
+                        disabled={confirmLocked}
+                        title={confirmLocked ? "请先完成下方确认门槛中的全部步骤" : undefined}
+                        onClick$={() => setStatus(status)}
+                      >
+                        {STATUS_LABELS[status]}
+                      </button>
+                    );
+                  })}
+                </div>
+                {active().status === "confirmed" && (
+                  <p class="mt-1 text-right text-[11px] font-bold text-success">三道门槛均已通过，标识已确认</p>
+                )}
               </div>
             </div>
           </div>
+
+          <ConfirmGatePanel sign={active()} />
 
           <div class="space-y-5 p-6">
             <section class="card border border-slate-200 bg-white shadow-sm">
@@ -405,7 +520,7 @@ export default component$(() => {
                 />
                 <div class="flex flex-wrap gap-2">
                   {active().terms.map((term) => {
-                    const matched = active().targetText.toLocaleLowerCase().includes(term.target.toLocaleLowerCase());
+                    const matched = termInText(term, active().targetText);
                     return (
                       <button
                         key={term.id}
@@ -413,7 +528,10 @@ export default component$(() => {
                         class={`badge badge-lg gap-1 ${matched && term.confirmed ? "badge-success" : matched ? "badge-warning" : "badge-error"}`}
                         onClick$={() => updateActive("确认术语", (sign) => {
                           const current = sign.terms.find((item) => item.id === term.id);
-                          if (current) current.confirmed = !current.confirmed;
+                          if (current) {
+                            current.confirmed = !current.confirmed;
+                            invalidateConfirmation(sign);
+                          }
                         })}
                       >
                         {term.source} → {term.target} {matched ? (term.confirmed ? "✓" : "!") : "×"}
@@ -443,8 +561,8 @@ export default component$(() => {
                         <div class="truncate text-xs text-slate-500">{term.target}</div>
                       </div>
                       <div class="flex gap-1">
-                        <button class={`btn btn-xs ${term.confirmed ? "btn-success" : "btn-ghost"}`} onClick$={() => updateActive("确认术语", (sign) => { const target = sign.terms.find((item) => item.id === term.id); if (target) target.confirmed = !target.confirmed; })}>确认</button>
-                        <button class="btn btn-xs btn-ghost text-error" onClick$={() => updateActive("删除术语", (sign) => { sign.terms = sign.terms.filter((item) => item.id !== term.id); })}>删除</button>
+                        <button class={`btn btn-xs ${term.confirmed ? "btn-success" : "btn-ghost"}`} onClick$={() => updateActive("确认术语", (sign) => { const target = sign.terms.find((item) => item.id === term.id); if (target) { target.confirmed = !target.confirmed; invalidateConfirmation(sign); } })}>确认</button>
+                        <button class="btn btn-xs btn-ghost text-error" onClick$={() => updateActive("删除术语", (sign) => { sign.terms = sign.terms.filter((item) => item.id !== term.id); invalidateConfirmation(sign); })}>删除</button>
                       </div>
                     </div>
                   ))}
@@ -476,7 +594,7 @@ export default component$(() => {
                       ) : (
                         <div class="mt-2 flex gap-2">
                           <button class="btn btn-xs btn-ghost" onClick$={() => { replyingTo.value = comment.id; }}>回复</button>
-                          <button class="btn btn-xs btn-ghost" onClick$={() => updateActive("更新意见状态", (sign) => { const item = sign.comments.find((entry) => entry.id === comment.id); if (item) item.resolved = !item.resolved; })}>{comment.resolved ? "重新打开" : "标记已解决"}</button>
+                          <button class="btn btn-xs btn-ghost" onClick$={() => updateActive("更新意见状态", (sign) => { const item = sign.comments.find((entry) => entry.id === comment.id); if (item) { item.resolved = !item.resolved; invalidateConfirmation(sign); } })}>{comment.resolved ? "重新打开" : "标记已解决"}</button>
                         </div>
                       )}
                     </article>

@@ -1,4 +1,37 @@
-import type { DiffToken, SignItem, TermBinding } from "./types";
+import type { DiffToken, ReviewComment, SignItem, TermBinding } from "./types";
+
+export function termInText(term: TermBinding, text: string) {
+  return text.toLocaleLowerCase().includes(term.target.toLocaleLowerCase());
+}
+
+export interface ConfirmationGate {
+  versionSaved: boolean;
+  missingRequired: TermBinding[];
+  unconfirmedRequired: TermBinding[];
+  unresolvedComments: ReviewComment[];
+  emergencyLocked: boolean;
+}
+
+export function confirmationGate(sign: SignItem): ConfirmationGate {
+  const required = sign.terms.filter((term) => term.required);
+  return {
+    versionSaved: sign.versions.length > 0,
+    missingRequired: required.filter((term) => !termInText(term, sign.targetText)),
+    unconfirmedRequired: required.filter((term) => termInText(term, sign.targetText) && !term.confirmed),
+    unresolvedComments: sign.comments.filter((comment) => !comment.resolved),
+    emergencyLocked: sign.emergencyRevision,
+  };
+}
+
+export function gatePassed(gate: ConfirmationGate) {
+  return (
+    gate.versionSaved &&
+    gate.missingRequired.length === 0 &&
+    gate.unconfirmedRequired.length === 0 &&
+    gate.unresolvedComments.length === 0 &&
+    !gate.emergencyLocked
+  );
+}
 
 export function estimatedLines(text: string, width: number, fontSize: number, lineHeight = 1.25) {
   if (!text.trim()) return [];
@@ -39,9 +72,7 @@ export function analyzeSign(sign: SignItem, width: number, fontSize: number) {
   const longest = lines.reduce((max, line) => Math.max(max, line.length), 0);
   const estimatedCharacterLimit = Math.max(12, Math.floor((width - 48) / (fontSize * 0.55)) * lineCapacity);
   const tooLong = sign.targetText.replace(/\s/g, "").length > estimatedCharacterLimit;
-  const missingTerms = sign.terms.filter(
-    (term) => term.required && !sign.targetText.toLocaleLowerCase().includes(term.target.toLocaleLowerCase()),
-  );
+  const missingTerms = sign.terms.filter((term) => term.required && !termInText(term, sign.targetText));
   return {
     lines,
     visible,
