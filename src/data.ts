@@ -19,6 +19,7 @@ const term = (source: string, target: string, confirmed = false, required = true
 });
 
 export const createSeedProject = (): SignProject => {
+  const exitTerms = [term("紧急出口", "EMERGENCY EXIT", true), term("电梯", "elevator", true)];
   const signs: SignItem[] = [
     {
       id: "sign-platform",
@@ -44,9 +45,19 @@ export const createSeedProject = (): SignProject => {
       scenario: "商场疏散通道",
       regulation: "GB 13495.1-2015 消防安全标志",
       status: "confirmed",
-      terms: [term("紧急出口", "EMERGENCY EXIT", true), term("电梯", "elevator", true)],
+      terms: exitTerms,
       comments: [],
-      versions: [],
+      versions: [
+        {
+          id: "version-seed-exit",
+          label: "版本 1",
+          createdAt: "2026-09-17T10:30:00.000Z",
+          sourceText: "紧急出口。发生紧急情况时，请按指示方向迅速撤离，不要乘坐电梯。",
+          targetText: "EMERGENCY EXIT\nIn an emergency, leave quickly in the direction shown. Do not use the elevator.",
+          status: "confirmed",
+          terms: structuredClone(exitTerms),
+        },
+      ],
       emergencyRevision: false,
       updatedAt: "2026-09-18T06:10:00.000Z",
     },

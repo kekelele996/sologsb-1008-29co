@@ -104,3 +104,92 @@ export function diffText(oldText: string, newText: string): DiffToken[] {
 export function cloneTerms(terms: TermBinding[]) {
   return structuredClone(terms);
 }
+
+export interface ConfirmationGate {
+  key: "version" | "terms" | "comments";
+  passed: boolean;
+  title: string;
+  action: string;
+  detail: string;
+}
+
+export function termInTranslation(sign: SignItem, term: TermBinding) {
+  return sign.targetText.toLocaleLowerCase().includes(term.target.toLocaleLowerCase());
+}
+
+export function requiredTermGroups(sign: SignItem) {
+  const required = sign.terms.filter((term) => term.required);
+  const missing = required.filter((term) => !termInTranslation(sign, term));
+  const unconfirmed = required.filter((term) => termInTranslation(sign, term) && !term.confirmed);
+  return { required, missing, unconfirmed };
+}
+
+const formatTermNames = (terms: TermBinding[]) =>
+  terms.map((term) => `「${term.source} → ${term.target}」`).join("、");
+
+/** 确认前的三道门槛：保存过版本、必选术语入文并逐条确认、无未解决审校意见。 */
+export function confirmationGates(sign: SignItem): ConfirmationGate[] {
+  const { required, missing, unconfirmed } = requiredTermGroups(sign);
+  const unresolved = sign.comments.filter((comment) => !comment.resolved);
+
+  const termProblems: string[] = [];
+  if (missing.length) termProblems.push(`未出现在译文中：${formatTermNames(missing)}`);
+  if (unconfirmed.length) termProblems.push(`已入文但尚未逐条确认：${formatTermNames(unconfirmed)}`);
+
+  return [
+    {
+      key: "version",
+      passed: sign.versions.length > 0,
+      title: "已保存过版本快照",
+      action: "保存版本快照",
+      detail: sign.versions.length > 0
+        ? `最近快照：${sign.versions[0].label}（${new Date(sign.versions[0].createdAt).toLocaleString()}）`
+        : "还没有保存过任何版本，请先在译文区点击“保存版本快照”。",
+    },
+    {
+      key: "terms",
+      passed: missing.length === 0 && unconfirmed.length === 0,
+      title: "必选术语全部入文并逐条确认",
+      action: "补全并逐条确认必选术语",
+      detail: termProblems.length
+        ? termProblems.join("；")
+        : required.length
+          ? `${required.length} 条必选术语均已出现在译文中并完成逐条确认。`
+          : "未绑定必选术语，该门槛自动通过；建议为固定译法绑定术语。",
+    },
+    {
+      key: "comments",
+      passed: unresolved.length === 0,
+      title: "审校意见没有未解决项",
+      action: "解决全部未决审校意见",
+      detail: unresolved.length
+        ? `还有 ${unresolved.length} 条审校意见未解决，请逐条回复并标记“已解决”。`
+        : sign.comments.length
+          ? `${sign.comments.length} 条审校意见均已解决。`
+          : "暂无审校意见。",
+    },
+  ];
+}
+
+export function canConfirm(sign: SignItem) {
+  return !sign.emergencyRevision && confirmationGates(sign).every((gate) => gate.passed);
+}
+
+/** 左侧清单逐条列出的当前待处理步骤；已确认标识返回空列表。 */
+export function pendingSteps(sign: SignItem): string[] {
+  if (sign.status === "confirmed") return [];
+  const steps: string[] = [];
+  const { missing, unconfirmed } = requiredTermGroups(sign);
+  const unresolved = sign.comments.filter((comment) => !comment.resolved).length;
+  if (sign.versions.length === 0) steps.push("保存版本快照");
+  if (missing.length) steps.push(`补入必选术语：${missing.map((term) => term.source).join("、")}`);
+  if (unconfirmed.length) steps.push(`逐条确认术语（${unconfirmed.length} 条）`);
+  if (unresolved) steps.push(`解决 ${unresolved} 条审校意见`);
+  if (steps.length === 0) steps.push("点击“已确认”完成审校");
+  return steps;
+}
+
+/** 读取历史数据时兜底：已确认但不满足门槛（含紧急修订）的标识退回待确认。 */
+export function reconcileConfirmation(sign: SignItem) {
+  if (sign.status === "confirmed" && !canConfirm(sign)) sign.status = "pending";
+}

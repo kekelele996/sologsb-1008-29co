@@ -2,7 +2,7 @@ import { $, component$, useSignal, useVisibleTask$, type QRL } from "@builder.io
 import { type DocumentHead } from "@builder.io/qwik-city";
 import { createSeedProject, STATUS_LABELS, uid } from "../data";
 import type { ReviewStatus, SignItem, SignProject } from "../types";
-import { analyzeSign, cloneTerms, diffText } from "../utils";
+import { analyzeSign, canConfirm, cloneTerms, confirmationGates, diffText, pendingSteps, reconcileConfirmation } from "../utils";
 
 const STORAGE_KEY = "sologsb-1008-project-v1";
 const WIDTHS = [320, 480, 720, 960] as const;
@@ -84,6 +84,13 @@ export default component$(() => {
   });
 
   const setStatus = $((status: ReviewStatus) => {
+    if (status === "confirmed") {
+      const current = project.value.signs.find((item) => item.id === project.value.activeSignId);
+      if (current && !canConfirm(current)) {
+        toast.value = "确认门槛未全部通过，请先完成页面上列出的待处理步骤。";
+        return;
+      }
+    }
     commit("更新审校状态", (draft) => {
       const sign = draft.signs.find((item) => item.id === draft.activeSignId);
       if (!sign) return;
@@ -132,7 +139,7 @@ export default component$(() => {
     if (!source || !target) return;
     updateActive("绑定术语", (sign) => {
       sign.terms.push({ id: uid("term"), source, target, required: true, confirmed: false });
-      sign.status = "pending";
+      if (sign.status === "confirmed") sign.status = "pending";
     });
     termSource.value = "";
     termTarget.value = "";
@@ -150,7 +157,7 @@ export default component$(() => {
         resolved: false,
         replies: [],
       });
-      sign.status = sign.status === "confirmed" ? "changes" : sign.status;
+      if (sign.status === "confirmed") sign.status = "pending";
     });
     commentDraft.value = "";
   });
@@ -161,6 +168,7 @@ export default component$(() => {
     updateActive("回复审校意见", (sign) => {
       const comment = sign.comments.find((item) => item.id === commentId);
       comment?.replies.push({ id: uid("reply"), author: "当前审校员", body, createdAt: new Date().toISOString() });
+      if (sign.status === "confirmed") sign.status = "pending";
     });
     replyDraft.value = "";
     replyingTo.value = "";
@@ -186,7 +194,10 @@ export default component$(() => {
     if (!hydrated.value) {
       try {
         const stored = JSON.parse(localStorage.getItem(STORAGE_KEY) ?? "") as { schema: number; project: SignProject };
-        if (stored.schema === 1 && stored.project?.signs?.length) project.value = stored.project;
+        if (stored.schema === 1 && stored.project?.signs?.length) {
+          stored.project.signs.forEach(reconcileConfirmation);
+          project.value = stored.project;
+        }
         const requestedPreview = new URLSearchParams(window.location.search).get("preview") ?? "";
         previewId.value = requestedPreview;
         readOnly.value = Boolean(requestedPreview);
@@ -338,6 +349,19 @@ export default component$(() => {
                       {risk.risk === "high" ? "高风险" : risk.risk === "medium" ? "需留意" : "版面正常"}
                     </span>
                   </div>
+                  {sign.status === "confirmed" ? (
+                    <div class="mt-2 flex items-center gap-1 text-[11px] font-semibold text-success">
+                      <span>✓</span><span>已确认，三道门槛齐备</span>
+                    </div>
+                  ) : (
+                    <ul class="mt-2 space-y-0.5 border-t border-dashed border-slate-200 pt-2 text-[11px] leading-4">
+                      {pendingSteps(sign).map((step, stepIndex) => (
+                        <li key={stepIndex} class="flex items-start gap-1 text-slate-600">
+                          <span class="mt-px shrink-0 text-warning">▸</span><span>{step}</span>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
                   <span class="sr-only">第 {index + 1} 条</span>
                 </button>
               );
@@ -353,11 +377,55 @@ export default component$(() => {
                 <h1 class="mt-1 text-xl font-bold">中文原文与译文校对</h1>
               </div>
               <div class="join">
-                {(["draft", "pending", "changes", "confirmed"] as ReviewStatus[]).map((status) => (
-                  <button key={status} class={`btn join-item btn-sm ${active().status === status ? "btn-primary" : "btn-outline"}`} onClick$={() => setStatus(status)}>{STATUS_LABELS[status]}</button>
-                ))}
+                {(["draft", "pending", "changes", "confirmed"] as ReviewStatus[]).map((status) => {
+                  const confirmLocked = status === "confirmed" && !canConfirm(active());
+                  return (
+                    <button
+                      key={status}
+                      class={`btn join-item btn-sm ${active().status === status ? "btn-primary" : "btn-outline"} ${confirmLocked ? "btn-disabled" : ""}`}
+                      disabled={confirmLocked}
+                      title={confirmLocked ? "请先完成下方“确认门槛检查”中列出的待处理步骤" : undefined}
+                      onClick$={() => setStatus(status)}
+                    >
+                      {STATUS_LABELS[status]}
+                    </button>
+                  );
+                })}
               </div>
             </div>
+          </div>
+
+          <div class="border-b border-amber-200 bg-amber-50 px-6 py-3">
+            {(() => {
+              const gates = confirmationGates(active());
+              const failed = gates.filter((gate) => !gate.passed);
+              return (
+                <>
+                  <div class="flex flex-wrap items-center gap-x-4 gap-y-1">
+                    <span class="text-sm font-bold text-slate-700">确认门槛检查</span>
+                    {failed.length ? (
+                      <span class="text-xs font-semibold text-error">“已确认”已锁定，还差 {failed.length} 项：{failed.map((gate) => gate.action).join("；")}</span>
+                    ) : (
+                      <span class="text-xs font-semibold text-success">三道门槛均已通过，可以点击“已确认”。</span>
+                    )}
+                  </div>
+                  <ul class="mt-2 grid gap-1.5">
+                    {gates.map((gate) => (
+                      <li class={`flex items-start gap-2 rounded-lg border px-3 py-2 text-xs ${gate.passed ? "border-success/40 bg-success/10 text-slate-700" : "border-error/40 bg-error/10 text-slate-800"}`}>
+                        <span class={`mt-0.5 grid h-4 w-4 shrink-0 place-items-center rounded-full text-[10px] font-black text-white ${gate.passed ? "bg-success" : "bg-error"}`}>{gate.passed ? "✓" : "!"}</span>
+                        <span class="min-w-0">
+                          <strong>{gate.title}</strong>
+                          <span class={gate.passed ? "text-slate-500" : "font-semibold text-error"}>　{gate.detail}</span>
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                  {active().emergencyRevision && (
+                    <p class="mt-2 text-xs font-semibold text-error">紧急修订模式下确认操作已锁定，修改完成后需重新审校并保存版本。</p>
+                  )}
+                </>
+              );
+            })()}
           </div>
 
           <div class="space-y-5 p-6">
@@ -401,7 +469,7 @@ export default component$(() => {
                 <textarea
                   class="textarea textarea-bordered min-h-36 w-full text-lg leading-8"
                   value={active().targetText}
-                  onInput$={(_, element) => updateActive("修改译文", (sign) => { sign.targetText = element.value; sign.status = sign.emergencyRevision ? "changes" : "pending"; })}
+                  onInput$={(_, element) => updateActive("修改译文", (sign) => { sign.targetText = element.value; if (sign.status === "confirmed") sign.status = "pending"; })}
                 />
                 <div class="flex flex-wrap gap-2">
                   {active().terms.map((term) => {
@@ -409,11 +477,15 @@ export default component$(() => {
                     return (
                       <button
                         key={term.id}
-                        title="点击切换术语确认状态"
-                        class={`badge badge-lg gap-1 ${matched && term.confirmed ? "badge-success" : matched ? "badge-warning" : "badge-error"}`}
+                        title={matched ? "点击切换术语确认状态" : "该必选术语尚未出现在译文中，无法确认"}
+                        disabled={!matched}
+                        class={`badge badge-lg gap-1 ${matched && term.confirmed ? "badge-success" : matched ? "badge-warning" : "badge-error pointer-events-none opacity-70"}`}
                         onClick$={() => updateActive("确认术语", (sign) => {
                           const current = sign.terms.find((item) => item.id === term.id);
-                          if (current) current.confirmed = !current.confirmed;
+                          if (current) {
+                            current.confirmed = !current.confirmed;
+                            if (!current.confirmed && sign.status === "confirmed") sign.status = "pending";
+                          }
                         })}
                       >
                         {term.source} → {term.target} {matched ? (term.confirmed ? "✓" : "!") : "×"}
@@ -436,18 +508,28 @@ export default component$(() => {
                   <button class="btn btn-sm btn-primary" onClick$={addTerm}>绑定</button>
                 </div>
                 <div class="mt-3 grid gap-2 md:grid-cols-2">
-                  {active().terms.map((term) => (
-                    <div key={term.id} class="flex items-center justify-between rounded-lg border border-slate-200 px-3 py-2">
+                  {active().terms.map((term) => {
+                    const matched = active().targetText.toLocaleLowerCase().includes(term.target.toLocaleLowerCase());
+                    return (
+                    <div key={term.id} class={`flex items-center justify-between rounded-lg border px-3 py-2 ${matched ? "border-slate-200" : "border-error/50 bg-error/5"}`}>
                       <div class="min-w-0">
                         <div class="truncate text-xs font-bold">{term.source}</div>
-                        <div class="truncate text-xs text-slate-500">{term.target}</div>
+                        <div class="truncate text-xs text-slate-500">{term.target}{matched ? "" : "（未出现在译文中）"}</div>
                       </div>
                       <div class="flex gap-1">
-                        <button class={`btn btn-xs ${term.confirmed ? "btn-success" : "btn-ghost"}`} onClick$={() => updateActive("确认术语", (sign) => { const target = sign.terms.find((item) => item.id === term.id); if (target) target.confirmed = !target.confirmed; })}>确认</button>
-                        <button class="btn btn-xs btn-ghost text-error" onClick$={() => updateActive("删除术语", (sign) => { sign.terms = sign.terms.filter((item) => item.id !== term.id); })}>删除</button>
+                        <button
+                          class={`btn btn-xs ${term.confirmed ? "btn-success" : "btn-ghost"}`}
+                          disabled={!matched}
+                          title={matched ? "逐条确认必选术语" : "术语未出现在译文中，无法确认"}
+                          onClick$={() => updateActive("确认术语", (sign) => { const target = sign.terms.find((item) => item.id === term.id); if (target) { target.confirmed = !target.confirmed; if (!target.confirmed && sign.status === "confirmed") sign.status = "pending"; } })}
+                        >
+                          {term.confirmed ? "已确认" : "确认"}
+                        </button>
+                        <button class="btn btn-xs btn-ghost text-error" onClick$={() => updateActive("删除术语", (sign) => { sign.terms = sign.terms.filter((item) => item.id !== term.id); if (sign.status === "confirmed") sign.status = "pending"; })}>删除</button>
                       </div>
                     </div>
-                  ))}
+                    );
+                  })}
                 </div>
               </div>
             </section>
@@ -476,7 +558,7 @@ export default component$(() => {
                       ) : (
                         <div class="mt-2 flex gap-2">
                           <button class="btn btn-xs btn-ghost" onClick$={() => { replyingTo.value = comment.id; }}>回复</button>
-                          <button class="btn btn-xs btn-ghost" onClick$={() => updateActive("更新意见状态", (sign) => { const item = sign.comments.find((entry) => entry.id === comment.id); if (item) item.resolved = !item.resolved; })}>{comment.resolved ? "重新打开" : "标记已解决"}</button>
+                          <button class="btn btn-xs btn-ghost" onClick$={() => updateActive("更新意见状态", (sign) => { const item = sign.comments.find((entry) => entry.id === comment.id); if (item) { item.resolved = !item.resolved; if (!item.resolved && sign.status === "confirmed") sign.status = "pending"; } })}>{comment.resolved ? "重新打开" : "标记已解决"}</button>
                         </div>
                       )}
                     </article>
